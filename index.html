@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Binance Futures RSI Pump / Dump Scanner (1D)</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<style>
+body{
+  font-family:Arial,system-ui;
+  background:#0f1720;
+  color:#e6eef8;
+  margin:16px;
+}
+h1{font-size:18px;margin-bottom:6px}
+.controls{
+  display:flex;
+  gap:8px;
+  flex-wrap:wrap;
+  margin-bottom:10px;
+}
+input,select{
+  padding:6px 10px;
+  border-radius:6px;
+  border:1px solid #334155;
+  background:#0b1220;
+  color:#e6eef8;
+}
+button{
+  padding:6px 14px;
+  border-radius:6px;
+  background:#22c55e;
+  border:none;
+  font-weight:700;
+  cursor:pointer;
+}
+.grid{
+  display:grid;
+  grid-template-columns:repeat(auto-fill,minmax(260px,1fr));
+  gap:10px;
+}
+.card{
+  background:#0b1220;
+  border:1px solid #172033;
+  border-radius:8px;
+  padding:10px;
+}
+.green{color:#22c55e}
+.red{color:#fb7185}
+.muted{color:#9fb3cc;font-size:13px}
+</style>
+</head>
+
+<body>
+
+<h1>RSI Pump / Dump Scanner — 1D (Daily)</h1>
+
+<div class="controls">
+  <input id="search" placeholder="Search symbol…" />
+  <select id="signalFilter">
+    <option value="">All Signals</option>
+    <option>MAX ZONE PUMP</option>
+    <option>MAX ZONE DUMP</option>
+    <option>BALANCE ZONE PUMP</option>
+    <option>BALANCE ZONE DUMP</option>
+    <option>LOWEST ZONE PUMP</option>
+    <option>LOWEST ZONE DUMP</option>
+  </select>
+  <button onclick="startScan()">Manual Scan</button>
+</div>
+
+<div id="status" class="muted">Idle</div>
+<div id="results" class="grid"></div>
+
+<script>
+/* ================= CONFIG ================= */
+const API = "https://fapi.binance.com";
+const TIMEFRAME = "1d";
+const KLINE_LIMIT = 200;
+const REQUEST_DELAY = 450;
+const AUTO_REFRESH_INTERVAL = 24 * 60 * 60 * 1000; // 24h
+
+const BLACKSET = new Set([
+"ALPACAUSDT","BNXUSDT","ALPHAUSDT","OCEANUSDT","DGBUSDT","AGIXUSDT",
+"LINAUSDT","LOKAUSDT","KEYUSDT","MDTUSDT","LOOMUSDT","RENUSDT",
+"OMNIUSDT","SLERFUSDT","STMXUSDT","UXLINKUSDT","BSWUSDT",
+"NEIROETHUSDT","VIDTUSDT","TROYUSDT","BAKEUSDT","MEMEFIUSDT",
+"NULSUSDT","HIFIUSDT","LEVERUSDT","XEMUSDT","STRAXUSDT",
+"COMBOUSDT","AI16ZUSDT","MILKUSDT","TOKENUSDT","SXPUSDT",
+"MYROUSDT","1000XUSDT","DARUSDT","PORT3USDT","SKATEUSDT",
+"AIAUSDT","AMBUSDT","FLMUSDT","PERPUSDT","OBOLUSDT",
+"SWELLUSDT","FTMUSDT"
+]);
+
+/* ================= STATE ================= */
+let allResults = [];
+let symbolsCache = [];
+let tickerMap = {};
+let scanIndex = 0;
+let scanning = false;
+
+/* ================= RSI ================= */
+function calculateRSI(closes, period=14){
+  if(closes.length <= period) return [];
+  let gains=0,losses=0,rsi=[];
+  for(let i=1;i<=period;i++){
+    const d=closes[i]-closes[i-1];
+    d>0?gains+=d:losses-=d;
+  }
+  let avgG=gains/period, avgL=losses/period;
+  rsi[period]=100-100/(1+(avgL===0?100:avgG/avgL));
+  for(let i=period+1;i<closes.length;i++){
+    const d=closes[i]-closes[i-1];
+    avgG=(avgG*(period-1)+(d>0?d:0))/period;
+    avgL=(avgL*(period-1)+(d<0?-d:0))/period;
+    rsi[i]=100-100/(1+(avgL===0?100:avgG/avgL));
+  }
+  return rsi;
+}
+
+/* ================= RSI DIFF ================= */
+function getRecentRSIDiff(rsi, lookback=14){
+  if(rsi.length < lookback) return null;
+  const s=rsi.slice(-lookback);
+  const hi=Math.max(...s);
+  const lo=Math.min(...s);
+  return {
+    pump:hi-lo,
+    dump:hi-lo,
+    direction:
+      s.at(-1)>s[0]?'pump':
+      s.at(-1)<s[0]?'dump':'neutral'
+  };
+}
+
+/* ================= SIGNAL ================= */
+function getSignal(rsi){
+  const d=getRecentRSIDiff(rsi);
+  if(!d) return "NO DATA";
+  if(d.direction==="pump" && d.pump>=25) return "MAX ZONE PUMP";
+  if(d.direction==="dump" && d.dump>=25) return "MAX ZONE DUMP";
+  if(d.direction==="pump" && d.pump>=18) return "BALANCE ZONE PUMP";
+  if(d.direction==="dump" && d.dump>=18) return "BALANCE ZONE DUMP";
+  if(d.direction==="pump" && d.pump<=8)  return "LOWEST ZONE PUMP";
+  if(d.direction==="dump" && d.dump<=8)  return "LOWEST ZONE DUMP";
+  return "NO STRONG SIGNAL";
+}
+
+/* ================= INIT + SCAN ================= */
+async function startScan(){
+  if(scanning) return;
+  scanning=true;
+
+  if(symbolsCache.length===0){
+    document.getElementById("status").innerText="Initializing symbols…";
+
+    const info=await fetch(API+"/fapi/v1/exchangeInfo").then(r=>r.json());
+    symbolsCache=info.symbols
+      .filter(s=>s.contractType==="PERPETUAL" && s.quoteAsset==="USDT" && !BLACKSET.has(s.symbol))
+      .map(s=>s.symbol);
+
+    const tickers=await fetch(API+"/fapi/v1/ticker/24hr").then(r=>r.json());
+    tickerMap=Object.fromEntries(tickers.map(t=>[t.symbol,t]));
+  }
+
+  scanNext();
+}
+
+async function scanNext(){
+  if(scanIndex>=symbolsCache.length){
+    scanIndex=0;
+    scanning=false;
+    document.getElementById("status").innerText="Idle (waiting next refresh)";
+    render();
+    return;
+  }
+
+  const sym=symbolsCache[scanIndex++];
+  document.getElementById("status").innerText=
+    `Scanning ${sym} (${scanIndex}/${symbolsCache.length})`;
+
+  try{
+    const k=await fetch(
+      `${API}/fapi/v1/klines?symbol=${sym}&interval=${TIMEFRAME}&limit=${KLINE_LIMIT}`
+    ).then(r=>r.json());
+
+    const closes=k.map(c=>+c[4]);
+    const rsi=calculateRSI(closes);
+    const signal=getSignal(rsi);
+    const change=+tickerMap[sym]?.priceChangePercent||0;
+
+    const existing=allResults.find(r=>r.symbol===sym);
+    if(existing){
+      existing.signal=signal;
+      existing.change=change;
+    }else{
+      allResults.push({symbol:sym,signal,change});
+    }
+  }catch(e){}
+
+  setTimeout(scanNext, REQUEST_DELAY);
+}
+
+/* ================= RENDER ================= */
+function render(){
+  const q=document.getElementById("search").value.toLowerCase();
+  const f=document.getElementById("signalFilter").value;
+
+  let list=allResults.filter(r=>
+    (!q||r.symbol.toLowerCase().includes(q)) &&
+    (!f||r.signal===f)
+  );
+
+  if(!q && !f){
+    const green=list.filter(r=>r.change>0).sort((a,b)=>b.change-a.change).slice(0,10);
+    const red=list.filter(r=>r.change<0).sort((a,b)=>a.change-b.change).slice(0,10);
+    list=[...green,...red];
+  }
+
+  const el=document.getElementById("results");
+  el.innerHTML="";
+  list.forEach(r=>{
+    el.innerHTML+=`
+      <div class="card">
+        <b>${r.symbol}</b>
+        <div class="${r.change>=0?'green':'red'}">${r.change.toFixed(2)}%</div>
+        <div class="muted">${r.signal}</div>
+      </div>
+    `;
+  });
+}
+
+/* ================= AUTO REFRESH ================= */
+function startAutoRefresh(){
+  startScan();
+  setInterval(()=>{
+    if(!scanning){
+      console.log("🔄 Auto daily refresh");
+      startScan();
+    }
+  }, AUTO_REFRESH_INTERVAL);
+}
+
+/* ================= UI ================= */
+document.getElementById("search").oninput=render;
+document.getElementById("signalFilter").onchange=render;
+setInterval(render,8000); // UI-only refresh
+
+startAutoRefresh();
+</script>
+
+</body>
+</html>
