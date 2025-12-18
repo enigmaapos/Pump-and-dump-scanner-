@@ -72,13 +72,18 @@ button{
 <div id="status" class="muted">Idle</div>
 <div id="results" class="grid"></div>
 
+
+
+
 <script>
 /* ================= CONFIG ================= */
 const API = "https://fapi.binance.com";
 const TIMEFRAME = "1d";
 const KLINE_LIMIT = 200;
-const REQUEST_DELAY = 450;
-const AUTO_REFRESH_INTERVAL = 24 * 60 * 60 * 1000; // 24h
+
+const BATCH_SIZE = 5;        // 🔥 faster scanning
+const BATCH_DELAY = 700;     // 🛡 safe pause
+const AUTO_REFRESH_INTERVAL = 24 * 60 * 60 * 1000;
 
 const BLACKSET = new Set([
 "ALPACAUSDT","BNXUSDT","ALPHAUSDT","OCEANUSDT","DGBUSDT","AGIXUSDT",
@@ -120,13 +125,11 @@ function calculateRSI(closes, period=14){
 
 /* ================= RSI DIFF ================= */
 function getRecentRSIDiff(rsi, lookback=14){
-  if(rsi.length < lookback) return null;
   const s=rsi.slice(-lookback);
   const hi=Math.max(...s);
   const lo=Math.min(...s);
   return {
-    pump:hi-lo,
-    dump:hi-lo,
+    diff: +(hi - lo).toFixed(2),
     direction:
       s.at(-1)>s[0]?'pump':
       s.at(-1)<s[0]?'dump':'neutral'
@@ -136,24 +139,26 @@ function getRecentRSIDiff(rsi, lookback=14){
 /* ================= SIGNAL ================= */
 function getSignal(rsi){
   const d=getRecentRSIDiff(rsi);
-  if(!d) return "NO DATA";
-  if(d.direction==="pump" && d.pump>=25) return "MAX ZONE PUMP";
-  if(d.direction==="dump" && d.dump>=25) return "MAX ZONE DUMP";
-  if(d.direction==="pump" && d.pump>=18) return "BALANCE ZONE PUMP";
-  if(d.direction==="dump" && d.dump>=18) return "BALANCE ZONE DUMP";
-  if(d.direction==="pump" && d.pump<=8)  return "LOWEST ZONE PUMP";
-  if(d.direction==="dump" && d.dump<=8)  return "LOWEST ZONE DUMP";
-  return "NO STRONG SIGNAL";
+  if(!d) return { signal:"NO DATA", diff:0 };
+
+  const v=d.diff;
+  if(d.direction==="pump" && v>=25) return { signal:"MAX ZONE PUMP", diff:v };
+  if(d.direction==="dump" && v>=25) return { signal:"MAX ZONE DUMP", diff:v };
+  if(d.direction==="pump" && v>=18) return { signal:"BALANCE ZONE PUMP", diff:v };
+  if(d.direction==="dump" && v>=18) return { signal:"BALANCE ZONE DUMP", diff:v };
+  if(d.direction==="pump" && v<=8)  return { signal:"LOWEST ZONE PUMP", diff:v };
+  if(d.direction==="dump" && v<=8)  return { signal:"LOWEST ZONE DUMP", diff:v };
+
+  return { signal:"NO STRONG SIGNAL", diff:v };
 }
 
-/* ================= INIT + SCAN ================= */
+/* ================= INIT ================= */
 async function startScan(){
   if(scanning) return;
   scanning=true;
 
   if(symbolsCache.length===0){
     document.getElementById("status").innerText="Initializing symbols…";
-
     const info=await fetch(API+"/fapi/v1/exchangeInfo").then(r=>r.json());
     symbolsCache=info.symbols
       .filter(s=>s.contractType==="PERPETUAL" && s.quoteAsset==="USDT" && !BLACKSET.has(s.symbol))
@@ -163,48 +168,52 @@ async function startScan(){
     tickerMap=Object.fromEntries(tickers.map(t=>[t.symbol,t]));
   }
 
-  scanNext();
+  scanBatch();
 }
 
-async function scanNext(){
-  if(scanIndex>=symbolsCache.length){
-    scanIndex=0;
-    scanning=false;
-    document.getElementById("status").innerText="Idle (waiting next refresh)";
+/* ================= BATCH SCAN ================= */
+async function scanBatch(){
+  if(scanIndex >= symbolsCache.length){
+    scanIndex = 0;
+    scanning = false;
+    document.getElementById("status").innerText="Idle (waiting refresh)";
     render();
     return;
   }
 
-  const sym=symbolsCache[scanIndex++];
-  document.getElementById("status").innerText=
-    `Scanning ${sym} (${scanIndex}/${symbolsCache.length})`;
+  const batch = symbolsCache.slice(scanIndex, scanIndex + BATCH_SIZE);
+  scanIndex += BATCH_SIZE;
 
-  try{
-    const k=await fetch(
-      `${API}/fapi/v1/klines?symbol=${sym}&interval=${TIMEFRAME}&limit=${KLINE_LIMIT}`
-    ).then(r=>r.json());
+  document.getElementById("status").innerText =
+    `Scanning ${scanIndex}/${symbolsCache.length}`;
 
-    const closes=k.map(c=>+c[4]);
-    const rsi=calculateRSI(closes);
-    const signal=getSignal(rsi);
-    const change=+tickerMap[sym]?.priceChangePercent||0;
+  await Promise.all(batch.map(async sym=>{
+    try{
+      const k=await fetch(
+        `${API}/fapi/v1/klines?symbol=${sym}&interval=${TIMEFRAME}&limit=${KLINE_LIMIT}`
+      ).then(r=>r.json());
 
-    const existing=allResults.find(r=>r.symbol===sym);
-    if(existing){
-      existing.signal=signal;
-      existing.change=change;
-    }else{
-      allResults.push({symbol:sym,signal,change});
-    }
-  }catch(e){}
+      const closes=k.map(c=>+c[4]);
+      const rsi=calculateRSI(closes);
+      const { signal, diff }=getSignal(rsi);
+      const change=+tickerMap[sym]?.priceChangePercent||0;
 
-  setTimeout(scanNext, REQUEST_DELAY);
+      const existing=allResults.find(r=>r.symbol===sym);
+      if(existing){
+        Object.assign(existing,{signal,change,diff});
+      }else{
+        allResults.push({symbol:sym,signal,change,diff});
+      }
+    }catch(e){}
+  }));
+
+  setTimeout(scanBatch, BATCH_DELAY);
 }
 
 /* ================= RENDER ================= */
 function render(){
-  const q=document.getElementById("search").value.toLowerCase();
-  const f=document.getElementById("signalFilter").value;
+  const q=search.value.toLowerCase();
+  const f=signalFilter.value;
 
   let list=allResults.filter(r=>
     (!q||r.symbol.toLowerCase().includes(q)) &&
@@ -217,37 +226,27 @@ function render(){
     list=[...green,...red];
   }
 
-  const el=document.getElementById("results");
-  el.innerHTML="";
-  list.forEach(r=>{
-    el.innerHTML+=`
-      <div class="card">
-        <b>${r.symbol}</b>
-        <div class="${r.change>=0?'green':'red'}">${r.change.toFixed(2)}%</div>
-        <div class="muted">${r.signal}</div>
-      </div>
-    `;
-  });
+  results.innerHTML=list.map(r=>`
+    <div class="card">
+      <b>${r.symbol}</b>
+      <div class="${r.change>=0?'green':'red'}">${r.change.toFixed(2)}%</div>
+      <div class="muted">${r.signal}</div>
+      <div class="muted">RSI Δ: ${r.diff}</div>
+    </div>
+  `).join('');
 }
 
-/* ================= AUTO REFRESH ================= */
+/* ================= AUTO ================= */
 function startAutoRefresh(){
   startScan();
-  setInterval(()=>{
-    if(!scanning){
-      console.log("🔄 Auto daily refresh");
-      startScan();
-    }
-  }, AUTO_REFRESH_INTERVAL);
+  setInterval(()=>!scanning && startScan(), AUTO_REFRESH_INTERVAL);
 }
 
-/* ================= UI ================= */
-document.getElementById("search").oninput=render;
-document.getElementById("signalFilter").onchange=render;
-setInterval(render,8000); // UI-only refresh
-
+search.oninput=render;
+signalFilter.onchange=render;
+setInterval(render,8000);
 startAutoRefresh();
-</script>
+    </script>
 
 </body>
 </html>
